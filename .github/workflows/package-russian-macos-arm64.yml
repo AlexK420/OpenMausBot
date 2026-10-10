@@ -19,7 +19,6 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 90
     env:
-      CSC_IDENTITY_AUTO_DISCOVERY: "false"
       NODE_OPTIONS: --max-old-space-size=4096
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -120,7 +119,11 @@ jobs:
           test -f "$RES/server/index.js"
           test -f "$RES/server/desktop-entry.mjs"
           lipo -archs "$APP/Contents/MacOS/OpenMausBot" | grep -qw arm64
-          codesign --verify --deep --strict "$APP"
+          if ! codesign --verify --deep --strict --verbose=4 "$APP"; then
+            codesign --display --verbose=4 "$APP" 2>&1 || true
+            find "$APP" -name CodeResources -print
+            exit 1
+          fi
           node scripts/smoke-browser-bundle.mjs --resources "$RES"
           OMB_SMOKE_DIST="$RES/server" node scripts/smoke-packaged-server.mjs --browser-bundle "$RES/browser-engine"
       - name: Write checksums and build information
