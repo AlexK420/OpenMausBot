@@ -1,0 +1,147 @@
+name: Package Russian macOS ARM64
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [russian-macos]
+    paths: [.github/workflows/package-russian-macos-arm64.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: russian-macos-arm64-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: Russian macOS ARM64 - DMG and ZIP
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      NODE_OPTIONS: --max-old-space-size=4096
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Require Apple Silicon
+        run: test "$(uname -m)" = arm64
+      - uses: pnpm/action-setup@ff378ebe6b225b0680b81c1ad4498ae0d1d3a5e3
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Validate the complete Russian catalog
+        run: |
+          python3 - <<'PY'
+          import json,re
+          from pathlib import Path
+          from collections import Counter
+          def unique(pairs):
+              result={}
+              for key,value in pairs:
+                  assert key not in result, 'Duplicate key: '+key
+                  result[key]=value
+              return result
+          en=json.loads(Path('src/locales/en.json').read_text(encoding='utf-8'),object_pairs_hook=unique)
+          ru=json.loads(Path('src/locales/ru.json').read_text(encoding='utf-8'),object_pairs_hook=unique)
+          assert set(ru)==set(en), 'Locale keys differ'
+          for key,value in ru.items():
+              assert isinstance(value,str), key
+              assert Counter(re.findall(r'\{(\w+)\}',value))==Counter(re.findall(r'\{(\w+)\}',en[key])), key
+              assert not re.search(r'\{[^{}]*[А-Яа-яЁё][^{}]*\}',value), key
+          registry=Path('src/locales/index.ts').read_text(encoding='utf-8')
+          assert 'import ru from "./ru.json";' in registry
+          assert '{ code: "ru", label: "Русский" }' in registry
+          print(json.dumps({'keys':len(ru),'placeholder_mismatches':0},ensure_ascii=False))
+          PY
+      - name: Prepare application and native helpers
+        run: |
+          pnpm package:prepare
+          pnpm build:speech
+          pnpm build:cua
+      - name: Configure test-only ad-hoc signing
+        run: |
+          python3 - <<'PY'
+          import plistlib
+          from pathlib import Path
+          source=Path('build/entitlements.mac.plist')
+          entitlements=plistlib.loads(source.read_bytes())
+          entitlements['com.apple.security.cs.allow-jit']=True
+          entitlements['com.apple.security.cs.disable-library-validation']=True
+          Path('build/entitlements.russian-adhoc.plist').write_bytes(plistlib.dumps(entitlements))
+          PY
+          node --input-type=module - <<'JS'
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import { createRequire } from 'node:module';
+          import YAML from 'yaml';
+          const require=createRequire(import.meta.url);
+          const builderRequire=createRequire(require.resolve('electron-builder/package.json'));
+          const libRoot=path.dirname(builderRequire.resolve('app-builder-lib/package.json'));
+          const schema=JSON.parse(fs.readFileSync(path.join(libRoot,'scheme.json'),'utf8'));
+          function properties(node,seen=new Set()) {
+            if (!node || typeof node!=='object') return {};
+            let result={...(node.properties||{})};
+            if (node.$ref && !seen.has(node.$ref)) {
+              const next=new Set(seen); next.add(node.$ref);
+              const resolved=node.$ref.slice(2).split('/').reduce((v,k)=>v[k],schema);
+              result={...properties(resolved,next),...result};
+            }
+            for (const item of [...(node.allOf||[]),...(node.anyOf||[]),...(node.oneOf||[])]) {
+              result={...properties(item,seen),...result};
+            }
+            return result;
+          }
+          const macProperties=properties(schema.properties.mac);
+          const config=YAML.parse(fs.readFileSync('electron-builder.yml','utf8'));
+          if ('sign' in macProperties) {
+            config.mac.sign={...(config.mac.sign||{}),identity:'-'};
+            delete config.mac.identity;
+          } else {
+            if (!('identity' in macProperties)) throw new Error('Unsupported macOS signing schema');
+            config.mac.identity='-';
+          }
+          config.mac.entitlements='build/entitlements.russian-adhoc.plist';
+          config.mac.entitlementsInherit='build/entitlements.russian-adhoc.plist';
+          config.mac.notarize=false;
+          config.dmg.sign=false;
+          fs.writeFileSync('build/electron-builder.russian.yml',YAML.stringify(config));
+          JS
+      - name: Package ARM64 without publishing a release
+        run: pnpm exec electron-builder --config build/electron-builder.russian.yml --mac dmg zip --arm64 --publish never
+      - name: Verify the packaged app and server
+        run: |
+          APP=release/mac-arm64/OpenMausBot.app
+          RES="$APP/Contents/Resources"
+          test -f "$RES/ui/index.html"
+          test -f "$RES/server/index.js"
+          test -f "$RES/server/desktop-entry.mjs"
+          lipo -archs "$APP/Contents/MacOS/OpenMausBot" | grep -qw arm64
+          codesign --verify --deep --strict "$APP"
+          node scripts/smoke-browser-bundle.mjs --resources "$RES"
+          OMB_SMOKE_DIST="$RES/server" node scripts/smoke-packaged-server.mjs --browser-bundle "$RES/browser-engine"
+      - name: Write checksums and build information
+        run: |
+          shasum -a 256 release/*-arm64.dmg release/*-arm64.zip > release/SHA256SUMS-russian-arm64.txt
+          {
+            echo "Repository: $GITHUB_REPOSITORY"
+            echo "Commit: $GITHUB_SHA"
+            echo "Version: $(node -p "require('./package.json').version")"
+            echo "Architecture: arm64"
+            echo "Locale: ru"
+            echo "Signing: ad-hoc; not Apple-notarized"
+          } > release/BUILD-INFO-russian-arm64.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: OpenMausBot-russian-macos-arm64
+          path: |
+            release/*-arm64.dmg
+            release/*-arm64.zip
+            release/SHA256SUMS-russian-arm64.txt
+            release/BUILD-INFO-russian-arm64.txt
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
